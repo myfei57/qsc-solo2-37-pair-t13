@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+import functools
+from typing import Any, Callable, Mapping, Sequence
 
 from ..alarms.board import AlarmBoard
 from ..aseptic.tank import AsepticTank
@@ -45,6 +46,26 @@ ACTION_LATCHES: dict[str, tuple[str, ...]] = {
     "aseptic-fill": (latch_names.ASEPTIC_PRESSURE,),
     "cip-pump-start": (latch_names.CIP_ALARM,),
 }
+
+
+def causal_command(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run one operator command inside a causation span.
+
+    The span opens on the audit entry of the evidence that permitted the
+    command (the durable preheat value behind a ramp, the confirmation
+    behind a fill, the stopped section behind the next shutdown step); the
+    audit entries the command itself emits then chain one to another.  The
+    result is a walkable "what triggered this" chain rather than isolated
+    records.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "LineControl", *args: Any, **kwargs: Any) -> Any:
+        trigger = self._command_trigger(method.__name__, args, kwargs)
+        with self.audit.causation(trigger):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class LineControl:
@@ -120,8 +141,47 @@ class LineControl:
                 stage=self.stages.current().value,
             )
 
+    # -- causal lineage ----------------------------------------------------
+
+    # Maps a command to the audit action whose latest entry is the
+    # evidence that permits (and therefore triggers) it.
+    COMMAND_TRIGGERS: dict[str, str] = {
+        "charge_balance": "intake",
+        "persist_preheat_temperature": "balance-charge",
+        "start_sterilization_ramp": "preheat-persist",
+        "confirm_sterilization": "uht-ramp",
+        "start_hold": "uht-confirm",
+        "start_cooling": "stage",
+        "fill_aseptic_tank": "aseptic-sterilize",
+        "complete_batch": "aseptic-fill",
+        "stop_cooling": "uht-stop",
+        "stop_balance": "cool-stop",
+        "start_cleaning_pump": "cip-confirm",
+    }
+
+    def _command_trigger(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+        audit = self.audit
+        if name == "sterilize_aseptic_tank":
+            confirmation = kwargs.get("confirmation_id")
+            entry = audit.find("uht-confirm", detail=str(confirmation)) if confirmation else None
+            return entry.entry_id if entry else None
+        if name == "close_batch":
+            entry = audit.find("batch-open", target=str(args[0]) if args else None)
+            return entry.entry_id if entry else None
+        trigger_action = self.COMMAND_TRIGGERS.get(name)
+        if trigger_action is None:
+            return None
+        if trigger_action == "stage":
+            # ``start_cooling`` follows entering the hold stage.
+            entry = audit.entries(limit=1)
+        else:
+            found = audit.find(trigger_action)
+            entry = [found] if found is not None else []
+        return entry[0].entry_id if entry else None
+
     # -- configuration -----------------------------------------------------
 
+    @causal_command
     def apply_config(self, config: ControlConfig, *, reason: str) -> dict[str, Any]:
         """Publish the generations that changed and report what moved."""
 
@@ -155,17 +215,20 @@ class LineControl:
 
     # -- record stream -----------------------------------------------------
 
+    @causal_command
     def commit_records(self, through: int | None = None) -> dict[str, Any]:
         state = self.events.commit(through)
         self.metrics.gauge("records.watermark", state.watermark)
         self.audit.record("records-commit", "line-events", f"watermark={state.watermark}", cause=None)
         return state.as_dict()
 
+    @causal_command
     def rollback_records(self) -> dict[str, Any]:
         discarded = self.events.rollback()
         self.audit.record("records-rollback", "line-events", f"discarded={discarded}", cause=None)
         return {"discarded": discarded, "state": self.events.state().as_dict()}
 
+    @causal_command
     def void_record(self, record_id: str, *, reason: str) -> dict[str, Any]:
         record = self.events.tombstone(record_id, reason)
         self.audit.record("records-void", record_id, str(reason), cause=None)
@@ -185,11 +248,13 @@ class LineControl:
 
     # -- batch -------------------------------------------------------------
 
+    @causal_command
     def open_batch(self, batch_id: str, product: str, *, reason: str) -> BatchRecord:
         record = self.batches.open(batch_id, product, reason=reason)
         self._count("batch.open")
         return record
 
+    @causal_command
     def close_batch(self, batch_id: str, outcome: str, *, reason: str) -> BatchRecord:
         validated = self.batches.validate_outcome(outcome)
         record = self.batches.close(batch_id, validated, reason=reason)
@@ -198,11 +263,13 @@ class LineControl:
 
     # -- production sequence ----------------------------------------------
 
+    @causal_command
     def start_intake(self, *, reason: str) -> dict[str, Any]:
         transition = self.stages.enter(Stage.INTAKE, reason=reason)
         self._count("stage.enter")
         return transition.as_dict()
 
+    @causal_command
     def receive(
         self,
         volume_litres: float,
@@ -223,6 +290,7 @@ class LineControl:
         self._count("intake.receive")
         return result
 
+    @causal_command
     def charge_balance(self, volume_litres: float, *, reason: str) -> dict[str, Any]:
         self._require_stage(Stage.INTAKE, action="balance-charge")
         entry = self.balance.charge(volume_litres, reason=reason)
@@ -230,6 +298,7 @@ class LineControl:
         self._count("balance.charge")
         return entry
 
+    @causal_command
     def persist_preheat_temperature(self, sensor_id: str, raw_c: float, *, reason: str) -> dict[str, Any]:
         self._require_stage(Stage.BALANCE, action="preheat-persist")
         record = self.preheat.persist_temperature(sensor_id, raw_c, reason=reason)
@@ -237,6 +306,7 @@ class LineControl:
         self._count("preheat.persist")
         return record
 
+    @causal_command
     def start_sterilization_ramp(self, target_c: float, *, reason: str) -> dict[str, Any]:
         self.gates.require_open(gate_names.TEMPERATURE_DURABLE, action="sterilization-ramp")
         self.latches.require_clear(latch_names.STERILIZATION_INTERLOCK, action="sterilization-ramp")
@@ -246,12 +316,14 @@ class LineControl:
         self._count("uht.ramp")
         return entry
 
+    @causal_command
     def confirm_sterilization(self, *, reason: str, ttl_seconds: float | None = None) -> dict[str, Any]:
         self._require_stage(Stage.STERILIZE, action="sterilization-confirm")
         confirmation = self.uht.confirm_sterilization(reason=reason, ttl_seconds=ttl_seconds)
         self._count("uht.confirm")
         return confirmation.as_dict()
 
+    @causal_command
     def sterilize_aseptic_tank(self, *, confirmation_id: str, reason: str) -> dict[str, Any]:
         issued = self.uht.require_confirmation()
         if issued.confirmation_id != str(confirmation_id):
@@ -265,12 +337,14 @@ class LineControl:
         self._count("aseptic.sterilize")
         return result
 
+    @causal_command
     def start_hold(self, *, reason: str) -> dict[str, Any]:
         self._require_stage(Stage.STERILIZE, action="hold-start")
         transition = self.stages.enter(Stage.HOLD, reason=reason)
         self._count("stage.enter")
         return transition.as_dict()
 
+    @causal_command
     def evaluate_dwell(self, *, baseline_id: str, raw_lph: float, reason: str) -> dict[str, Any]:
         entry = self.hold.evaluate(baseline_id=baseline_id, raw_lph=raw_lph, reason=reason)
         self.decisions.record(
@@ -284,6 +358,7 @@ class LineControl:
         self._count("hold.evaluate")
         return entry
 
+    @causal_command
     def recover_hold(self, value_c: float, *, baseline_id: str, raw_lph: float, reason: str) -> dict[str, Any]:
         result = self.hold.recover(
             value_c,
@@ -301,6 +376,7 @@ class LineControl:
         )
         return result
 
+    @causal_command
     def start_cooling(self, *, reason: str) -> dict[str, Any]:
         self._require_stage(Stage.HOLD, action="cooling-start")
         self.stages.enter(Stage.COOL, reason=reason)
@@ -308,6 +384,7 @@ class LineControl:
         self._count("cool.start")
         return entry
 
+    @causal_command
     def fill_aseptic_tank(self, volume_litres: float, *, reason: str, key: str | None = None) -> dict[str, Any]:
         self._require_stage(Stage.COOL, action="aseptic-fill")
         result = self.aseptic.fill(volume_litres, reason=reason, key=key)
@@ -315,6 +392,7 @@ class LineControl:
         self._count("aseptic.fill")
         return result
 
+    @causal_command
     def complete_batch(self, outcome: str, *, reason: str) -> dict[str, Any]:
         self._require_stage(Stage.ASEPTIC_FILL, action="batch-complete")
         active = self.batches.active()
@@ -324,21 +402,25 @@ class LineControl:
         self.stages.enter(Stage.COMPLETE, reason=reason)
         return closed.as_dict()
 
+    @causal_command
     def stop_sterilization(self, *, reason: str) -> dict[str, Any]:
         entry = self.uht.stop(reason=reason)
         self._count("uht.stop")
         return entry
 
+    @causal_command
     def stop_cooling(self, *, reason: str) -> dict[str, Any]:
         entry = self.cool.stop(reason=reason)
         self._count("cool.stop")
         return entry
 
+    @causal_command
     def stop_balance(self, *, reason: str) -> dict[str, Any]:
         entry = self.balance.stop(reason=reason)
         self._count("balance.stop")
         return entry
 
+    @causal_command
     def shutdown(self, *, reason: str) -> dict[str, Any]:
         """Stop the sections in the only permitted order."""
 
@@ -349,6 +431,7 @@ class LineControl:
         ]
         return {"steps": steps, "stage": self.stages.current().value}
 
+    @causal_command
     def reset_line(self, *, reason: str) -> dict[str, Any]:
         transition = self.stages.reset(reason=reason)
         self._count("stage.reset")
@@ -356,11 +439,13 @@ class LineControl:
 
     # -- cleaning ----------------------------------------------------------
 
+    @causal_command
     def start_cleaning(self, *, reason: str) -> dict[str, Any]:
         transition = self.stages.start_cleaning(reason=reason)
         self._count("cip.enter")
         return transition.as_dict()
 
+    @causal_command
     def confirm_cleaning_temperature(
         self,
         value_c: float,
@@ -372,11 +457,13 @@ class LineControl:
         self._count("cip.confirm")
         return result
 
+    @causal_command
     def start_cleaning_pump(self, flow_lph: float, *, reason: str) -> dict[str, Any]:
         entry = self.cip.start_pump(flow_lph=flow_lph, reason=reason)
         self._count("cip.start")
         return entry
 
+    @causal_command
     def finish_cleaning(self, elapsed_seconds: float, *, reason: str) -> dict[str, Any]:
         completion = self.cip.cycle_complete(elapsed_seconds=elapsed_seconds, reason=reason)
         stop = self.cip.stop_pump(reason=reason)
@@ -393,6 +480,7 @@ class LineControl:
         reading = self.flowmeter.record(raw_lph)
         return reading.as_dict()
 
+    @causal_command
     def recalibrate_temperature(
         self,
         sensor_id: str,
@@ -406,17 +494,20 @@ class LineControl:
         self._count("instruments.calibrate")
         return sensor.as_dict()
 
+    @causal_command
     def remap_sensor(self, sensor_id: str, position: str, *, reason: str) -> dict[str, Any]:
         sensor = self.thermometry.remap(sensor_id, position, reason=reason)
         self.warranties.expire_stale()
         return sensor.as_dict()
 
+    @causal_command
     def recalibrate_flow(self, gain: float, offset: float = 0.0, *, reason: str) -> dict[str, Any]:
         revision = self.flowmeter.calibrate(gain, offset, reason=reason)
         self.warranties.expire_stale()
         self._count("instruments.calibrate")
         return revision.as_dict()
 
+    @causal_command
     def confirm_flow_baseline(self, *, reason: str) -> dict[str, Any]:
         baseline = self.warranties.record_baseline(
             "flow-calibration",
@@ -430,6 +521,7 @@ class LineControl:
         self._count("baseline.record")
         return baseline.as_dict()
 
+    @causal_command
     def capture_snapshot(self, name: str, *, reason: str, ttl_seconds: float | None = None) -> dict[str, Any]:
         snapshot = self.warranties.capture_snapshot(
             name,
@@ -470,6 +562,7 @@ class LineControl:
         self._count("decision.evaluate")
         return payload
 
+    @causal_command
     def record_state(self, *, reason: str) -> dict[str, Any]:
         entry = self.timeline.record(
             "state",
@@ -484,6 +577,13 @@ class LineControl:
         if entry is None:
             raise NotFoundError("no state was published at or before that revision", revision=int(revision))
         return entry.as_dict()
+
+    def audit_trace(self, entry_id: str) -> dict[str, Any]:
+        """Walk the cause edges back from one audit entry."""
+
+        if self.audit.get(entry_id) is None:
+            raise NotFoundError("no audit entry with that id", entry_id=str(entry_id))
+        return self.audit.trace(entry_id).as_dict()
 
     def decision_history(
         self,
@@ -501,11 +601,13 @@ class LineControl:
 
     # -- alarms ------------------------------------------------------------
 
+    @causal_command
     def raise_alarm(self, code: str, *, severity: str, message: str, target: str = "line", reason: str = "") -> dict[str, Any]:
         alarm = self.alarms.raise_alarm(code, severity=severity, message=message, target=target, reason=reason)
         self._count("alarm.raise")
         return alarm
 
+    @causal_command
     def clear_alarm(self, code: str, *, reason: str) -> dict[str, Any]:
         alarm = self.alarms.clear(code, reason=reason)
         self._count("alarm.clear")
@@ -530,13 +632,14 @@ class LineControl:
         self.metrics.gauge("records.watermark", self.events.watermark())
         self.metrics.gauge("alarms.active", self.alarms.counts()["active"])
         stream = self.events.state()
-        return {
+        audit = self.audit.verify()
+        health = {
             "status": "ok",
             "line_code": self.config.line_code,
             "stage": self.stages.current().value,
             "records": stream.as_dict(),
             "audit_entries": self.audit.size(),
-            "audit_valid": self.audit.verify()["valid"],
+            "audit_valid": audit["valid"],
             "alarms": self.alarms.counts(),
             "latches": self.latches.state(),
             "active_latches": self.latches.active(),
@@ -546,6 +649,12 @@ class LineControl:
             "decisions": self.decisions.counts(),
             "metrics": self.metrics.snapshot(),
         }
+        if not audit["valid"]:
+            health["status"] = "degraded"
+            health["audit_failure"] = {
+                key: value for key, value in audit.items() if key not in {"valid", "entries"}
+            }
+        return health
 
     def snapshot(self) -> dict[str, Any]:
         return {

@@ -70,7 +70,14 @@ class CipCycle:
     def is_running(self) -> bool:
         return self._running
 
-    def confirm_temperature(self, value_c: float, *, reason: str, ttl_seconds: float | None = None) -> dict[str, Any]:
+    def confirm_temperature(
+        self,
+        value_c: float,
+        *,
+        reason: str,
+        ttl_seconds: float | None = None,
+        cause: str | None = None,
+    ) -> dict[str, Any]:
         envelope = self.config.cleaning
         value = require_within(
             value_c,
@@ -106,10 +113,10 @@ class CipCycle:
         }
         self._history.append(entry)
         self.persist()
-        self.audit.record("cip-confirm", "cip", f"{value:g} C", cause=None)
+        self.audit.record("cip-confirm", "cip", f"{value:g} C", cause=cause)
         return {"confirmation": confirmation.as_dict(), "event": entry}
 
-    def start_pump(self, *, flow_lph: float, reason: str) -> dict[str, Any]:
+    def start_pump(self, *, flow_lph: float, reason: str, cause: str | None = None) -> dict[str, Any]:
         self.latches.require_clear(latch_names.CIP_ALARM, action="cip-pump-start")
         self.gates.require_open(gate_names.CIP_TEMPERATURE_CONFIRMED, action="cip-pump-start")
         if self._confirmation_id is None:
@@ -139,7 +146,7 @@ class CipCycle:
         }
         self._history.append(entry)
         self.persist()
-        self.audit.record("cip-pump-start", "cip", f"{flow:g} L/h", cause=None)
+        self.audit.record("cip-pump-start", "cip", f"{flow:g} L/h", cause=cause)
         return dict(entry)
 
     def stop_pump(self, *, reason: str) -> dict[str, Any]:

@@ -216,10 +216,20 @@ class ConsoleApp:
         }
 
     def _audit(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
+        entry_id = query.get("entry")
+        if entry_id:
+            return {"trace": self.control.audit_trace(entry_id)}
         limit = int(query.get("limit", 25))
         return {
             "integrity": self.control.audit.verify(),
-            "entries": [entry.as_dict() for entry in self.control.audit.entries(limit=limit)],
+            "entries": [
+                entry.as_dict()
+                for entry in self.control.audit.entries(
+                    target=query.get("target"),
+                    action=query.get("action"),
+                    limit=limit,
+                )
+            ],
             "targets": self.control.audit.targets(),
         }
 

@@ -60,6 +60,14 @@ def render_overview(snapshot: dict[str, Any], health: dict[str, Any]) -> str:
         {"field": "alarms", "value": health["alarms"]["active"]},
         {"field": "audit valid", "value": health["audit_valid"]},
     ]
+    failure = health.get("audit_failure")
+    if failure:
+        rows.append(
+            {
+                "field": "audit tamper",
+                "value": f"{failure.get('reason')} at {failure.get('at')}",
+            }
+        )
     gate_rows = snapshot["gates"]
     latch_rows = snapshot["latches"]
     return _page(

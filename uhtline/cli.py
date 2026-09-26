@@ -57,6 +57,8 @@ def _build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit", help="inspect the audit chain")
     audit.add_argument("--limit", type=int, default=25)
     audit.add_argument("--target")
+    audit.add_argument("--action")
+    audit.add_argument("--entry", help="walk the cause trail back from one entry id")
 
     precheck = subparsers.add_parser("precheck", help="read-only action precheck")
     precheck.add_argument("action")
@@ -171,10 +173,20 @@ def main(argv: Sequence[str] | None = None, *, server_factory: type[ConsoleServe
         )
         return 0
     if command == "audit":
+        if args.entry:
+            _json_print({"trace": control.audit_trace(args.entry)})
+            return 0
         _json_print(
             {
                 "integrity": control.audit.verify(),
-                "entries": [entry.as_dict() for entry in control.audit.entries(target=args.target, limit=args.limit)],
+                "entries": [
+                    entry.as_dict()
+                    for entry in control.audit.entries(
+                        target=args.target,
+                        action=args.action,
+                        limit=args.limit,
+                    )
+                ],
                 "targets": control.audit.targets(),
             }
         )

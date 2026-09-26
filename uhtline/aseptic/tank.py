@@ -79,7 +79,7 @@ class AsepticTank:
     def pressure_kpa(self) -> float:
         return self._pressure_kpa
 
-    def sterilize(self, *, confirmation_id: str, reason: str) -> dict[str, Any]:
+    def sterilize(self, *, confirmation_id: str, reason: str, cause: str | None = None) -> dict[str, Any]:
         """Accept a confirmation; a superseded one is refused here."""
 
         confirmation = self.warranties.require_confirmation(
@@ -106,10 +106,10 @@ class AsepticTank:
         }
         self._history.append(entry)
         self.persist()
-        self.audit.record("aseptic-sterilize", "aseptic", confirmation.confirmation_id, cause=None)
+        self.audit.record("aseptic-sterilize", "aseptic", confirmation.confirmation_id, cause=cause)
         return {"confirmation": confirmation.as_dict(), "event": entry}
 
-    def fill(self, volume_litres: float, *, reason: str, key: str | None = None) -> dict[str, Any]:
+    def fill(self, volume_litres: float, *, reason: str, key: str | None = None, cause: str | None = None) -> dict[str, Any]:
         self.gates.require_open(gate_names.ASEPTIC_STERILE, action="aseptic-fill")
         self.latches.require_clear(latch_names.ASEPTIC_PRESSURE, action="aseptic-fill")
         envelope = self.config.throughput
@@ -145,7 +145,7 @@ class AsepticTank:
         self._fills.append(fill)
         self._history.append({"action": "fill", **fill})
         self.persist()
-        self.audit.record("aseptic-fill", "aseptic", f"{volume:g} L", cause=None)
+        self.audit.record("aseptic-fill", "aseptic", f"{volume:g} L", cause=cause)
         return {"fill": fill, "staged": record.as_dict(), "level_litres": projected}
 
     def pressurize(self, value_kpa: float, *, reason: str) -> dict[str, Any]:

@@ -81,7 +81,7 @@ class UhtSection:
     def confirmation_id(self) -> str | None:
         return self._confirmation_id
 
-    def start_ramp(self, target_c: float, *, reason: str) -> dict[str, Any]:
+    def start_ramp(self, target_c: float, *, reason: str, cause: str | None = None) -> dict[str, Any]:
         """Refuse to ramp until the preheat temperature is durable on disk."""
 
         self.gates.require_open(gate_names.TEMPERATURE_DURABLE, action="sterilization-ramp")
@@ -116,10 +116,10 @@ class UhtSection:
         }
         self._history.append(entry)
         self.persist()
-        self.audit.record("uht-ramp", "uht", f"target {target:g} C", cause=None)
+        self.audit.record("uht-ramp", "uht", f"target {target:g} C", cause=cause)
         return dict(entry)
 
-    def confirm_sterilization(self, *, reason: str, ttl_seconds: float | None = None) -> Confirmation:
+    def confirm_sterilization(self, *, reason: str, ttl_seconds: float | None = None, cause: str | None = None) -> Confirmation:
         """Issue the confirmation that unlocks the aseptic fill."""
 
         if not self._running:
@@ -137,7 +137,7 @@ class UhtSection:
             evidence=confirmation.confirmation_id,
         )
         self.persist()
-        self.audit.record("uht-confirm", "uht", confirmation.confirmation_id, cause=None)
+        self.audit.record("uht-confirm", "uht", confirmation.confirmation_id, cause=cause)
         return confirmation
 
     def require_confirmation(self) -> Confirmation:
@@ -150,7 +150,7 @@ class UhtSection:
             subject="sterilization",
         )
 
-    def stop(self, *, reason: str) -> dict[str, Any]:
+    def stop(self, *, reason: str, cause: str | None = None) -> dict[str, Any]:
         if not self._running:
             raise StateError("the sterilization section is already stopped", section="uht")
         self._running = False
@@ -159,7 +159,7 @@ class UhtSection:
         entry = {"action": "stop", "record_id": record.record_id, "reason": str(reason), "timestamp": self.clock.timestamp()}
         self._history.append(entry)
         self.persist()
-        self.audit.record("uht-stop", "uht", str(reason), cause=None)
+        self.audit.record("uht-stop", "uht", str(reason), cause=cause)
         return dict(entry)
 
     def trip(self, *, reason: str, detail: str = "") -> dict[str, Any]:

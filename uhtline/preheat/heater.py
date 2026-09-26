@@ -84,7 +84,7 @@ class PreheatSection:
             "reason": str(reason),
         }
 
-    def persist_temperature(self, sensor_id: str, raw_c: float, *, reason: str) -> dict[str, Any]:
+    def persist_temperature(self, sensor_id: str, raw_c: float, *, reason: str, cause: str | None = None) -> dict[str, Any]:
         """Durably record the preheat temperature and open the ramp permit."""
 
         measured = self.measure(sensor_id, raw_c, reason=reason)
@@ -111,7 +111,7 @@ class PreheatSection:
             "preheat-persist",
             str(measured["sensor"]),
             f"{measured['value_c']:g} C durable={measured['in_spec']}",
-            cause=None,
+            cause=cause,
         )
         return dict(record)
 

@@ -120,7 +120,7 @@ class Runtime:
         invalid = [item for item in documents if not item["valid"]]
         stream = self.events.state()
         audit = self.audit.verify()
-        return {
+        report = {
             "data_root": str(self.store.root),
             "documents": len(documents),
             "invalid_documents": len(invalid),
@@ -134,6 +134,11 @@ class Runtime:
             "sensors": [sensor.sensor_id for sensor in self.thermometry.sensors()],
             "valid": not invalid and bool(audit["valid"]),
         }
+        if not audit["valid"]:
+            report["audit_failure"] = {
+                key: value for key, value in audit.items() if key not in {"valid", "entries"}
+            }
+        return report
 
 
 def _define_equipment(gates: GateBoard, latches: LatchBoard) -> None:

@@ -92,12 +92,20 @@ class PersistenceError(ServiceError):
     status = 500
 
 
+class LedgerIntegrityError(PersistenceError):
+    """Raised when the append-only audit chain has been altered."""
+
+    code = "ledger-integrity"
+    status = 500
+
+
 __all__ = [
     "ConcurrencyConflictError",
     "DuplicateError",
     "GateClosedError",
     "InterlockError",
     "LatchActiveError",
+    "LedgerIntegrityError",
     "NotFoundError",
     "PersistenceError",
     "RangeError",
