@@ -68,6 +68,21 @@ class AuditLedger:
     def digest(entry: dict[str, Any]) -> str:
         return hashlib.sha256(canonical_json(entry).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _body(entry: AuditEntry) -> dict[str, Any]:
+        """Everything an entry commits to; the hash covers the full body."""
+
+        return {
+            "sequence": entry.sequence,
+            "entry_id": entry.entry_id,
+            "action": entry.action,
+            "target": entry.target,
+            "detail": entry.detail,
+            "cause": entry.cause,
+            "timestamp": entry.timestamp,
+            "previous_hash": entry.previous_hash,
+        }
+
     def record(
         self,
         action: str,
@@ -78,7 +93,7 @@ class AuditLedger:
     ) -> AuditEntry:
         if not str(action).strip():
             raise ValidationError("audit action must not be empty")
-        sequence = len(self._entries) + 1
+        sequence = 1 if not self._entries else self._entries[-1].sequence + 1
         previous_hash = GENESIS_HASH if not self._entries else self._entries[-1].entry_hash
         body = {
             "sequence": sequence,
@@ -90,9 +105,7 @@ class AuditLedger:
             "timestamp": self.clock.timestamp(),
             "previous_hash": previous_hash,
         }
-        body["entry_hash"] = hashlib.sha256(
-            canonical_json({"action": body["action"], "target": body["target"], "detail": body["detail"]}).encode("utf-8")
-        ).hexdigest()
+        body["entry_hash"] = self.digest(body)
         entry = AuditEntry(**body)
         self._entries.append(entry)
         self.store.append_journal(self.journal, entry.as_dict(), limit=self.limit)
@@ -129,8 +142,24 @@ class AuditLedger:
         return None
 
     def trail(self, entry_id: str) -> list[AuditEntry]:
+        """Walk the cause chain back to its root, returned oldest-first."""
+
         entry = self.get(entry_id)
-        return [] if entry is None else [entry]
+        if entry is None:
+            return []
+        by_id = {item.entry_id: item for item in self._entries}
+        chain = [entry]
+        seen = {entry.entry_id}
+        cause = entry.cause
+        while cause is not None and cause not in seen:
+            parent = by_id.get(cause)
+            if parent is None:
+                break
+            chain.append(parent)
+            seen.add(parent.entry_id)
+            cause = parent.cause
+        chain.reverse()
+        return chain
 
     def targets(self) -> dict[str, dict[str, Any]]:
         counts: dict[str, dict[str, Any]] = {}
@@ -142,9 +171,28 @@ class AuditLedger:
         return counts
 
     def verify(self) -> dict[str, Any]:
+        """Recompute every hash and check each link against its predecessor."""
+
+        def failure(reason: str, entry: AuditEntry) -> dict[str, Any]:
+            return {
+                "valid": False,
+                "reason": reason,
+                "at": entry.entry_id,
+                "entries": len(self._entries),
+            }
+
+        previous: AuditEntry | None = None
         for entry in self._entries:
             if not entry.entry_hash:
-                return {"valid": False, "reason": "missing-hash", "at": entry.entry_id}
+                return failure("missing-hash", entry)
+            if entry.entry_hash != self.digest(self._body(entry)):
+                return failure("entry-hash-mismatch", entry)
+            if previous is None:
+                if entry.sequence == 1 and entry.previous_hash != GENESIS_HASH:
+                    return failure("chain-break", entry)
+            elif entry.sequence != previous.sequence + 1 or entry.previous_hash != previous.entry_hash:
+                return failure("chain-break", entry)
+            previous = entry
         head = GENESIS_HASH if not self._entries else self._entries[-1].entry_hash
         return {"valid": True, "entries": len(self._entries), "head": head}
 
